@@ -443,7 +443,12 @@ async def process_batch_transcription(meeting: Meeting, db: AsyncSession):
             for c_file, offset_sec in chunk_files:
                 with open(c_file, 'rb') as f:
                     files = {"file": ("audio.wav", f, "audio/wav")}
-                    data = {"model": transcription_model, "response_format": "verbose_json", "language": "en"}
+                    data = {
+                        "model": transcription_model, 
+                        "response_format": "verbose_json", 
+                        "language": "en",
+                        "timestamp_granularities[]": "word"
+                    }
                     r = await client.post(
                         transcription_url,
                         headers={"Authorization": f"Bearer {groq_key}"},
@@ -455,14 +460,27 @@ async def process_batch_transcription(meeting: Meeting, db: AsyncSession):
                         
                     resp_json = r.json()
                     
-                    if "words" in resp_json:
+                    if "words" in resp_json and resp_json["words"]:
                         for w in resp_json["words"]:
                             all_words.append({"start": w["start"] + offset_sec, "end": w["end"] + offset_sec, "word": w["word"]})
                     elif "segments" in resp_json:
                         for s in resp_json["segments"]:
-                            if "words" in s:
+                            if "words" in s and s["words"]:
                                 for w in s["words"]:
                                     all_words.append({"start": w["start"] + offset_sec, "end": w["end"] + offset_sec, "word": w["word"]})
+                            else:
+                                # Fallback: Interpolate word timings from the segment timings
+                                seg_text = s.get("text", "").strip()
+                                seg_words = seg_text.split()
+                                if not seg_words:
+                                    continue
+                                s_start = s.get("start", 0.0)
+                                s_end = s.get("end", s_start + 1.0)
+                                word_dur = (s_end - s_start) / len(seg_words)
+                                for idx, w_txt in enumerate(seg_words):
+                                    w_start = s_start + (idx * word_dur) + offset_sec
+                                    w_end = w_start + word_dur
+                                    all_words.append({"start": w_start, "end": w_end, "word": w_txt})
 
         if not all_words: return
 
