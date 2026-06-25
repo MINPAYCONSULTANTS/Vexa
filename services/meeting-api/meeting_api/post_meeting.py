@@ -356,6 +356,227 @@ async def finalize_in_progress_recordings(meeting: Meeting, db: AsyncSession) ->
     return finalized_count
 
 
+async def process_batch_transcription(meeting: Meeting, db: AsyncSession):
+    import os, tempfile, wave, httpx, asyncio
+    from .storage import create_storage_client
+    from .models import Transcription
+    from .meetings import _map_speakers_to_segments
+    from sqlalchemy.future import select
+
+    if not meeting.data or not meeting.data.get("transcribe_enabled", True):
+        return
+
+    # Check if transcripts already exist
+    stmt = select(Transcription).where(Transcription.meeting_id == meeting.id)
+    result = await db.execute(stmt)
+    if result.scalars().first():
+        logger.info(f"Transcripts already exist for meeting {meeting.id}, skipping batch processing.")
+        return
+
+    recordings = meeting.data.get("recordings", [])
+    audio_path = None
+    for rec in recordings:
+        for mf in rec.get("media_files", []):
+            if mf.get("type") == "audio" and (mf.get("storage_path", "").endswith("master.wav") or mf.get("storage_path", "").endswith("master.webm")):
+                audio_path = mf["storage_path"]
+                break
+        if audio_path: break
+
+    if not audio_path:
+        logger.warning(f"No master audio found for meeting {meeting.id}, skipping batch transcription.")
+        return
+
+        groq_key = os.getenv("TRANSCRIPTION_SERVICE_TOKEN") or os.getenv("GROQ_API_KEY") or os.getenv("OPENAI_API_KEY")
+    if not groq_key:
+        logger.error("No API key found for batch transcription.")
+        return
+
+    storage = create_storage_client()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        master_local_raw = os.path.join(tmpdir, "master_raw" + os.path.splitext(audio_path)[1])
+        master_local = os.path.join(tmpdir, "master.wav")
+        await asyncio.to_thread(storage.download_file_to_path, audio_path, master_local_raw)
+
+        # Convert to WAV if needed
+        import subprocess
+        if master_local_raw.endswith(".webm"):
+            try:
+                subprocess.run(["ffmpeg", "-y", "-i", master_local_raw, "-ar", "16000", "-ac", "1", master_local], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception as e:
+                logger.error(f"Failed to convert webm to wav for meeting {meeting.id}: {e}")
+                return
+        else:
+            import shutil
+            shutil.copy(master_local_raw, master_local)
+
+        chunk_files = []
+        with wave.open(master_local, 'rb') as w:
+            framerate = w.getframerate()
+            nchannels = w.getnchannels()
+            sampwidth = w.getsampwidth()
+            frames_total = w.getnframes()
+            
+            # 10 minutes = 600 seconds
+            frames_per_chunk = framerate * 600 
+            
+            frames_read = 0
+            chunk_idx = 0
+            while frames_read < frames_total:
+                chunk_frames = w.readframes(frames_per_chunk)
+                if not chunk_frames: break
+                chunk_file = os.path.join(tmpdir, f"chunk_{chunk_idx}.wav")
+                with wave.open(chunk_file, 'wb') as cw:
+                    cw.setnchannels(nchannels)
+                    cw.setsampwidth(sampwidth)
+                    cw.setframerate(framerate)
+                    cw.writeframes(chunk_frames)
+                chunk_files.append((chunk_file, chunk_idx * 600))
+                frames_read += frames_per_chunk
+                chunk_idx += 1
+
+        transcription_url = os.getenv("TRANSCRIPTION_BASE_URL", "https://api.groq.com/openai/v1/audio/transcriptions")
+        transcription_model = os.getenv("TRANSCRIPTION_MODEL", "whisper-large-v3")
+        
+        all_words = []
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            for c_file, offset_sec in chunk_files:
+                with open(c_file, 'rb') as f:
+                    files = {"file": ("audio.wav", f, "audio/wav")}
+                    data = {"model": transcription_model, "response_format": "verbose_json", "language": "en"}
+                    r = await client.post(
+                        transcription_url,
+                        headers={"Authorization": f"Bearer {groq_key}"},
+                        files=files, data=data
+                    )
+                    if r.status_code != 200:
+                        logger.error(f"Groq API error: {r.text}")
+                        continue
+                        
+                    resp_json = r.json()
+                    
+                    if "words" in resp_json:
+                        for w in resp_json["words"]:
+                            all_words.append({"start": w["start"] + offset_sec, "end": w["end"] + offset_sec, "word": w["word"]})
+                    elif "segments" in resp_json:
+                        for s in resp_json["segments"]:
+                            if "words" in s:
+                                for w in s["words"]:
+                                    all_words.append({"start": w["start"] + offset_sec, "end": w["end"] + offset_sec, "word": w["word"]})
+
+        if not all_words: return
+
+        stt_segments = []
+        current_segment = {"speaker": "Speaker", "text": [], "start_time": all_words[0]["start"], "end_time": all_words[0]["end"]}
+        
+        for i, w in enumerate(all_words):
+            word_text = w["word"].strip()
+            if not word_text: continue
+                
+            current_segment["text"].append(word_text)
+            current_segment["end_time"] = w["end"]
+            
+            is_end_of_sentence = word_text[-1] in ".!?"
+            pause_duration = 0
+            if i + 1 < len(all_words):
+                pause_duration = all_words[i+1]["start"] - w["end"]
+                
+            if pause_duration > 1.5 or is_end_of_sentence or len(current_segment["text"]) > 20:
+                current_segment["text"] = " ".join(current_segment["text"])
+                stt_segments.append(current_segment)
+                if i + 1 < len(all_words):
+                    current_segment = {"speaker": "Speaker", "text": [], "start_time": all_words[i+1]["start"], "end_time": all_words[i+1]["end"]}
+
+        if not stt_segments: return
+
+        speaker_events = meeting.data.get("speaker_events", [])
+        if speaker_events:
+            for s in stt_segments:
+                s["start_time_ms"] = int(s["start_time"] * 1000)
+            stt_segments = _map_speakers_to_segments(speaker_events, stt_segments)
+
+        for s in stt_segments:
+            new_t = Transcription(
+                meeting_id=meeting.id,
+                speaker=s.get("speaker", "Speaker"),
+                text=s["text"],
+                start_time=s["start_time"],
+                end_time=s["end_time"],
+                is_final=True,
+                language="en"
+            )
+            db.add(new_t)
+            
+        await db.commit()
+        logger.info(f"Batch transcription completed for meeting {meeting.id} with {len(stt_segments)} segments")
+
+
+
+async def generate_ai_summary(meeting: Meeting, db: AsyncSession):
+    from .models import Transcription
+    from sqlalchemy.orm.attributes import flag_modified
+    import os
+    import httpx
+    
+    if not meeting.data or not meeting.data.get("transcribe_enabled", True):
+        return
+
+    # Skip if notes already exist and it's not empty
+    existing_notes = meeting.data.get("notes", "").strip()
+    if existing_notes:
+        return
+
+    groq_key = os.getenv("TRANSCRIPTION_SERVICE_TOKEN") or os.getenv("GROQ_API_KEY") or os.getenv("OPENAI_API_KEY")
+    if not groq_key:
+        logger.warning("No API key found for AI summary generation.")
+        return
+
+    try:
+        stmt = select(Transcription).where(Transcription.meeting_id == meeting.id).order_by(Transcription.start_time)
+        result = await db.execute(stmt)
+        segments = result.scalars().all()
+        
+        if not segments:
+            return
+            
+        transcript_text = "\n".join([f"{seg.speaker}: {seg.text}" for seg in segments])
+        
+        if len(transcript_text.strip()) < 20:
+            return
+
+        prompt = f"Please generate a concise, professional summary of the following meeting transcript. Highlight key decisions, action items, and main discussion points. Be concise.\n\nTranscript:\n{transcript_text}"
+        
+        llm_url = os.getenv("LLM_BASE_URL", "https://api.groq.com/openai/v1/chat/completions")
+        llm_model = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                llm_url,
+                headers={"Authorization": f"Bearer {groq_key}"},
+                json={
+                    "model": llm_model,
+                    "messages": [
+                        {"role": "system", "content": "You are an AI meeting assistant that creates highly accurate and concise summaries."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "max_tokens": 1000,
+                    "temperature": 0.3
+                },
+                timeout=60.0
+            )
+            response.raise_for_status()
+            summary = response.json()["choices"][0]["message"]["content"].strip()
+            
+            data = dict(meeting.data)
+            data["notes"] = f"**AI Summary:**\n\n{summary}"
+            meeting.data = data
+            flag_modified(meeting, "data")
+            logger.info(f"AI Summary generated for meeting {meeting.id}")
+            
+    except Exception as e:
+        logger.error(f"Failed to generate AI summary for meeting {meeting.id}: {e}")
+
+
 async def run_all_tasks(meeting_id: int):
     """Run all post-meeting tasks for a given meeting_id.
 
@@ -376,17 +597,34 @@ async def run_all_tasks(meeting_id: int):
     except Exception as e:
         logger.error(f"Recording finalization failed for meeting {meeting_id}: {e}", exc_info=True)
 
-    # Task 1: Aggregate transcription data (makes HTTP call to collector)
+    # Task 1.1: Batch Transcription via Groq
     try:
         async with async_session_local() as db:
             meeting = await db.get(Meeting, meeting_id)
-            if not meeting:
-                logger.error(f"Meeting {meeting_id} not found for post-meeting tasks")
-                return
-            await aggregate_transcription(meeting, db)
-            await db.commit()
+            if meeting:
+                await process_batch_transcription(meeting, db)
+    except Exception as e:
+        logger.error(f"Batch transcription failed for meeting {meeting_id}: {e}", exc_info=True)
+
+    # Task 1.2: Aggregate transcription chunks into a single document (for UI)
+    try:
+        async with async_session_local() as db:
+            meeting = await db.get(Meeting, meeting_id)
+            if meeting:
+                await aggregate_transcription(meeting, db)
+                await db.commit()
     except Exception as e:
         logger.error(f"Transcription aggregation failed for meeting {meeting_id}: {e}", exc_info=True)
+
+    # Task 1.5: Generate AI Summary (makes HTTP call to Groq)
+    try:
+        async with async_session_local() as db:
+            meeting = await db.get(Meeting, meeting_id)
+            if meeting:
+                await generate_ai_summary(meeting, db)
+                await db.commit()
+    except Exception as e:
+        logger.error(f"AI summary generation failed for meeting {meeting_id}: {e}", exc_info=True)
 
     # Task 2: Send completion webhook to user (makes HTTP call to user's endpoint)
     try:
